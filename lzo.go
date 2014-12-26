@@ -77,6 +77,14 @@ func (e errno) Error() string {
 	return "lzo: errno " + strconv.Itoa(int(e))
 }
 
+// Blocker metadata about block of compressed file.
+type Blocker struct {
+	block       []byte
+	srcLen      uint32
+	dstLen      uint32
+	dstChecksum uint32
+}
+
 // Header metadata about the compressed file.
 // This header is exposed as the fields of the Writer and Reader structs.
 type Header struct {
@@ -95,11 +103,29 @@ type Reader struct {
 	adler32 hash.Hash32
 	crc32   hash.Hash32
 	err     error
+
+	// For BlockReaders
+	nextChanIdx  int
+	BlockerChans []chan *Blocker
 }
 
 // NewReader creates a new Reader reading the given reader.
 func NewReader(r io.Reader) (*Reader, error) {
 	z := new(Reader)
+	z.adler32 = adler32.New()
+	z.crc32 = crc32.NewIEEE()
+	z.r = io.TeeReader(r, io.MultiWriter(z.adler32, z.crc32))
+	if err := z.readHeader(); err != nil {
+		return nil, err
+	}
+	return z, nil
+}
+
+// NewBlockReaders creates a new Reader reading the given reader
+// to Blocker channels concurrently.
+func NewBlockReaders(r io.Reader, b ...chan *Blocker) (*Reader, error) {
+	z := new(Reader)
+	z.BlockerChans = b
 	z.adler32 = adler32.New()
 	z.crc32 = crc32.NewIEEE()
 	z.r = io.TeeReader(r, io.MultiWriter(z.adler32, z.crc32))
@@ -317,35 +343,64 @@ func (z *Reader) nextBlock() {
 			return
 		}
 	}
+
 	// Decompress
-	data := make([]byte, dstLen)
-	if srcLen < dstLen {
-		_, z.err = lzoDecompress(block, data)
-		if z.err != nil {
-			return
+	blocker := &Blocker{
+		block,
+		srcLen,
+		dstLen,
+		dstChecksum,
+	}
+
+	// (1) Decompress for BlockReaders
+	if z.BlockerChans != nil {
+		z.BlockerChans[z.nextChanIdx] <- blocker
+		z.nextChanIdx = (z.nextChanIdx + 1) % len(z.BlockerChans)
+		return
+	}
+
+	// (2) Decompress for normal reader
+	var data []byte
+	data, z.err = z.BlockDecompress(blocker, z.adler32, z.crc32)
+	if z.err != nil {
+		return
+	}
+
+	// Add block to our history
+	z.hist = append(z.hist, data...)
+}
+
+// BlockDecompress decompresses Blocker and return uncompressed data and error,
+// adler32 and crc32 should be created before passing to the function:
+// z.adler32 = adler32.New()
+// z.crc32 = crc32.NewIEEE()
+func (z *Reader) BlockDecompress(b *Blocker, adler32 hash.Hash32, crc32 hash.Hash32) ([]byte, error) {
+	data := make([]byte, b.dstLen)
+	if b.srcLen < b.dstLen {
+		_, err := lzoDecompress(b.block, data)
+		if err != nil {
+			return nil, err
 		}
 	} else {
-		copy(data, block)
+		copy(data, b.block)
 	}
 	// Verify uncompressed block checksum
 	if z.flags&flagAdler32D != 0 {
-		z.adler32.Reset()
-		z.adler32.Write(data)
-		if dstChecksum != z.adler32.Sum32() {
-			z.err = errors.New("lzo: data corruption")
-			return
+		adler32.Reset()
+		adler32.Write(data)
+		if b.dstChecksum != adler32.Sum32() {
+			return nil, errors.New("lzo: data corruption")
 		}
 	}
 	if z.flags&flagCRC32D != 0 {
-		z.crc32.Reset()
-		z.crc32.Write(data)
-		if dstChecksum != z.crc32.Sum32() {
-			z.err = errors.New("lzo: data corruption")
-			return
+		crc32.Reset()
+		crc32.Write(data)
+		if b.dstChecksum != crc32.Sum32() {
+			return nil, errors.New("lzo: data corruption")
 		}
 	}
-	// Add block to our history
-	z.hist = append(z.hist, data...)
+
+	return data, nil
 }
 
 func (z *Reader) Read(p []byte) (int, error) {
@@ -360,6 +415,24 @@ func (z *Reader) Read(p []byte) (int, error) {
 		}
 		z.nextBlock()
 	}
+}
+
+func (z *Reader) StartBlockReaders() {
+	go func() {
+		for {
+			if z.err != nil {
+				for _, c := range z.BlockerChans {
+					close(c)
+				}
+				return
+			}
+			z.nextBlock()
+		}
+	}()
+}
+
+func (z *Reader) Error() error {
+	return z.err
 }
 
 // Close closes the Reader. It does not close the underlying io.Reader.
